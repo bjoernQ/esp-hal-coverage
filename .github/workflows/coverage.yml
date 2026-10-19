@@ -1,0 +1,669 @@
+name: ESP-HAL HIL Coverage
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "esp-rs/esp-hal branch, tag, or SHA to checkout"
+        required: false
+        default: "main"
+        type: string
+      chips:
+        description: 'Space- or comma-separated list of targets to run, or "all"'
+        required: false
+        default: "all"
+        type: string
+      tests:
+        description: "Optional comma-separated list of HIL test binary names to run"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages-coverage
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  setup:
+    name: Setup Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - name: Resolve chip matrix
+        id: resolve
+        uses: actions/github-script@v7
+        env:
+          INPUT_CHIPS: ${{ inputs.chips }}
+        with:
+          script: |
+            const ALL_TARGETS = [
+              {
+                chip: "esp32",
+                arch: "xtensa",
+                connections: ["2=4"],
+                i2c: { sda: "32", scl: "33" },
+              },
+              {
+                chip: "esp32s2",
+                arch: "xtensa",
+                connections: ["9=10", "37=38"],
+                i2c: { sda: "3", scl: "2" },
+              },
+              {
+                chip: "esp32s3",
+                arch: "xtensa",
+                connections: ["9=10", "40=41"],
+                i2c: { sda: "3", scl: "2" },
+              },
+              {
+                chip: "esp32c3",
+                arch: "riscv",
+                connections: ["2=3", "6=7"],
+                i2c: { sda: "4", scl: "5" },
+              },
+              {
+                chip: "esp32c5",
+                arch: "riscv",
+                connections: ["9=10", "4=5"],
+                i2c: { sda: "2", scl: "3" },
+              },
+              {
+                chip: "esp32c6",
+                arch: "riscv",
+                connections: ["2=3", "22=23"],
+                i2c: { sda: "6", scl: "7" },
+              },
+              {
+                chip: "esp32c61",
+                arch: "riscv",
+                connections: ["2=3", "22=23"],
+                i2c: { sda: "6", scl: "7" },
+              },
+              {
+                chip: "esp32h2",
+                arch: "riscv",
+                connections: ["2=3", "10=11"],
+                i2c: { sda: "12", scl: "22" },
+              },
+              {
+                chip: "esp32p4",
+                arch: "riscv",
+                connections: ["5=6", "46=53"],
+                i2c: { sda: "2", scl: "3" },
+              },
+              {
+                chip: "esp32s31",
+                arch: "riscv",
+                connections: ["2=3", "8=44"],
+                i2c: { sda: "7", scl: "6" },
+              },
+            ];
+
+            const raw = (process.env.INPUT_CHIPS || "all").trim();
+            let selected;
+            if (!raw || raw.toLowerCase() === "all") {
+              selected = ALL_TARGETS;
+            } else {
+              const requested = new Set(
+                raw
+                  .split(/[\s,]+/)
+                  .map((s) => s.trim().toLowerCase())
+                  .filter(Boolean)
+              );
+              selected = ALL_TARGETS.filter((t) => requested.has(t.chip));
+              const unknown = [...requested].filter(
+                (c) => !ALL_TARGETS.some((t) => t.chip === c)
+              );
+              if (unknown.length > 0) {
+                core.warning(
+                  `Ignoring unsupported or unknown chips: ${unknown.join(", ")}`
+                );
+              }
+            }
+
+            if (selected.length === 0) {
+              core.setFailed(`No valid Wokwi targets matched '${raw}'`);
+              return;
+            }
+
+            core.info(
+              `Selected targets: ${selected.map((t) => t.chip).join(", ")}`
+            );
+            core.setOutput("matrix", JSON.stringify({ include: selected }));
+
+  coverage:
+    name: Coverage (${{ matrix.chip }})
+    needs: setup
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - name: Checkout esp-rs/esp-hal
+        uses: actions/checkout@v4
+        with:
+          repository: esp-rs/esp-hal
+          ref: ${{ inputs.ref || 'main' }}
+
+      - name: Setup Xtensa toolchain
+        if: matrix.arch == 'xtensa'
+        uses: ./.github/actions/setup-toolchains
+        with:
+          xtensa: "true"
+          xtensa-buildtargets: ${{ matrix.chip }}
+          xtensa-default: "true"
+
+      - name: Setup RISC-V toolchain (stable + nightly)
+        if: matrix.arch == 'riscv'
+        uses: ./.github/actions/setup-toolchains
+        with:
+          riscv: "true"
+          riscv-targets: all
+
+      - name: Setup Nightly Rust toolchain
+        if: matrix.arch == 'riscv'
+        uses: ./.github/actions/setup-nightly
+        with:
+          targets: all
+          components: rust-src
+          alias: "true"
+
+      - name: Install grcov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: grcov
+
+      - name: Cache wokwi-test-runner
+        id: cache-runner
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/wokwi-test-runner
+          key: wokwi-test-runner-${{ runner.os }}-v1
+
+      - name: Install wokwi-test-runner and wokwi-cli
+        uses: actions/github-script@v7
+        env:
+          RUNNER_CACHED: ${{ steps.cache-runner.outputs.cache-hit }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+            const os = require("os");
+
+            const cargoBin = path.join(os.homedir(), ".cargo", "bin");
+            fs.mkdirSync(cargoBin, { recursive: true });
+            core.addPath(cargoBin);
+
+            // Download wokwi-cli static binary (same source as wokwi/wokwi-ci-action)
+            const wokwiCliUrl =
+              "https://github.com/wokwi/wokwi-cli/releases/latest/download/wokwi-cli-linuxstatic-x64";
+            const wokwiCliPath = path.join(cargoBin, "wokwi-cli");
+            core.info(`Downloading wokwi-cli from ${wokwiCliUrl}...`);
+            const response = await fetch(wokwiCliUrl);
+            if (!response.ok) {
+              throw new Error(
+                `Failed to download wokwi-cli: ${response.status} ${response.statusText}`
+              );
+            }
+            const buffer = Buffer.from(await response.arrayBuffer());
+            fs.writeFileSync(wokwiCliPath, buffer, { mode: 0o755 });
+            fs.chmodSync(wokwiCliPath, 0o755);
+
+            // Install wokwi-test-runner if not restored from cache
+            if (process.env.RUNNER_CACHED !== "true") {
+              core.info("Installing wokwi-test-runner from git...");
+              await exec.exec("cargo", [
+                "install",
+                "--git",
+                "https://github.com/bjoernQ/wokwi-test-runner",
+                "--locked",
+              ]);
+            } else {
+              core.info("Using cached wokwi-test-runner binary.");
+            }
+
+      - name: Start Wokwi CI Server
+        uses: wokwi/wokwi-ci-server-action@v1
+
+      - name: Build HIL tests, run via wokwi-test-runner, and merge coverage
+        uses: actions/github-script@v7
+        env:
+          CHIP: ${{ matrix.chip }}
+          TARGET_CONFIG: ${{ toJSON(matrix) }}
+          INPUT_TESTS: ${{ inputs.tests }}
+          WOKWI_CLI_TOKEN: ${{ secrets.WOKWI_CLI_TOKEN }}
+          CARGO_PROFILE_RELEASE_DEBUG: "2"
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            const chip = process.env.CHIP;
+            const targetConfig = JSON.parse(process.env.TARGET_CONFIG);
+            const inputTests = (process.env.INPUT_TESTS || "").trim();
+
+            if (!process.env.WOKWI_CLI_TOKEN) {
+              core.warning(
+                "WOKWI_CLI_TOKEN secret is not set. wokwi-test-runner requires a valid WOKWI_CLI_TOKEN."
+              );
+            }
+
+            // 1. Build HIL tests for the target chip with DWARF debug info enabled
+            const buildArgs = ["xtask", "build", "tests", chip];
+            if (inputTests) {
+              const selectors = inputTests
+                .split(/[\s,]+/)
+                .map((s) => s.trim())
+                .filter(Boolean);
+              if (selectors.length > 0) {
+                buildArgs.push("--test", selectors.join(","));
+              }
+            }
+
+            core.startGroup(`Building HIL tests for ${chip}`);
+            await exec.exec("cargo", buildArgs, {
+              env: {
+                ...process.env,
+                CARGO_PROFILE_RELEASE_DEBUG: "2",
+              },
+            });
+            core.endGroup();
+
+            // 2. Discover built ELF binaries
+            const testsDir = path.join("target", "tests", chip);
+            if (!fs.existsSync(testsDir)) {
+              core.setFailed(`Expected ELF directory not found: ${testsDir}`);
+              return;
+            }
+
+            const elfFiles = fs
+              .readdirSync(testsDir, { withFileTypes: true })
+              .filter(
+                (entry) =>
+                  entry.isFile() &&
+                  !entry.name.endsWith(".json") &&
+                  !entry.name.startsWith(".")
+              )
+              .map((entry) => entry.name)
+              .sort();
+
+            core.info(
+              `Found ${elfFiles.length} HIL test binaries for ${chip}: ${elfFiles.join(", ")}`
+            );
+
+            const lcovDir = path.join("coverage-lcov", chip);
+            const rawCovDir = path.join("coverage-raw", chip);
+            const pagesDir = path.join("pages", chip);
+            fs.mkdirSync(lcovDir, { recursive: true });
+            fs.mkdirSync(rawCovDir, { recursive: true });
+            fs.mkdirSync(pagesDir, { recursive: true });
+
+            // 3. Run each ELF binary in Wokwi via wokwi-test-runner
+            const results = [];
+            for (const binName of elfFiles) {
+              const elfPath = path.join(testsDir, binName);
+              const lcovPath = path.join(lcovDir, `${binName}.info`);
+              const covJsonPath = path.join(rawCovDir, `${binName}.json`);
+
+              const runnerArgs = [
+                "--lcov-file",
+                lcovPath,
+                "--coverage-file",
+                covJsonPath,
+              ];
+
+              for (const conn of targetConfig.connections || []) {
+                runnerArgs.push("--connect", conn);
+              }
+
+              // Attach BMP180 sensor on the chip's I2C pins for the i2c test binary
+              if (binName === "i2c" && targetConfig.i2c) {
+                runnerArgs.push(
+                  "--part",
+                  "bmp=board-bmp180",
+                  "--connect",
+                  "bmp:VCC=3V3",
+                  "--connect",
+                  "bmp:GND=GND.1",
+                  "--connect",
+                  `bmp:SDA=${targetConfig.i2c.sda}`,
+                  "--connect",
+                  `bmp:SCL=${targetConfig.i2c.scl}`
+                );
+              }
+
+              runnerArgs.push(chip, elfPath);
+
+              core.startGroup(`Running ${chip} / ${binName}`);
+              const started = Date.now();
+              const exitCode = await exec.exec("wokwi-test-runner", runnerArgs, {
+                ignoreReturnCode: true,
+              });
+              const durationSec = ((Date.now() - started) / 1000).toFixed(1);
+              core.endGroup();
+
+              const hasLcov =
+                fs.existsSync(lcovPath) && fs.statSync(lcovPath).size > 0;
+              if (!hasLcov && fs.existsSync(lcovPath)) {
+                fs.unlinkSync(lcovPath);
+              }
+
+              results.push({
+                binary: binName,
+                passed: exitCode === 0,
+                exitCode,
+                hasCoverage: hasLcov,
+                durationSec: Number(durationSec),
+              });
+            }
+
+            // 4. Merge per-target coverage with grcov
+            const infoFiles = fs
+              .readdirSync(lcovDir)
+              .filter((f) => f.endsWith(".info"));
+
+            let linesFound = 0;
+            let linesHit = 0;
+
+            if (infoFiles.length > 0) {
+              core.startGroup(`Generating merged coverage report for ${chip}`);
+              await exec.exec("grcov", [
+                lcovDir,
+                "-s",
+                ".",
+                "--ignore-not-existing",
+                "--keep-only",
+                "esp-hal/src/**",
+                "-t",
+                "html",
+                "-o",
+                pagesDir,
+              ]);
+
+              const mergedLcovPath = path.join(pagesDir, "lcov.info");
+              await exec.exec("grcov", [
+                lcovDir,
+                "-s",
+                ".",
+                "--ignore-not-existing",
+                "--keep-only",
+                "esp-hal/src/**",
+                "-t",
+                "lcov",
+                "-o",
+                mergedLcovPath,
+              ]);
+              core.endGroup();
+
+              if (fs.existsSync(mergedLcovPath)) {
+                const lcovContent = fs.readFileSync(mergedLcovPath, "utf8");
+                for (const line of lcovContent.split(/\r?\n/)) {
+                  if (line.startsWith("LF:")) {
+                    linesFound += parseInt(line.slice(3), 10) || 0;
+                  } else if (line.startsWith("LH:")) {
+                    linesHit += parseInt(line.slice(3), 10) || 0;
+                  }
+                }
+              }
+            } else {
+              core.warning(`No LCOV tracefiles were produced for ${chip}`);
+              fs.writeFileSync(
+                path.join(pagesDir, "index.html"),
+                `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${chip} Coverage</title></head><body><h1>No coverage data collected for ${chip}</h1></body></html>`
+              );
+            }
+
+            const coveragePct =
+              linesFound > 0 ? ((linesHit / linesFound) * 100).toFixed(2) : "0.00";
+            const summary = {
+              chip,
+              arch: targetConfig.arch,
+              linesFound,
+              linesHit,
+              coveragePct: Number(coveragePct),
+              totalBinaries: results.length,
+              passedBinaries: results.filter((r) => r.passed).length,
+              failedBinaries: results.filter((r) => !r.passed).length,
+              results,
+            };
+
+            fs.writeFileSync(
+              path.join(pagesDir, "summary.json"),
+              JSON.stringify(summary, null, 2)
+            );
+
+            await core.summary
+              .addHeading(`Coverage Summary: ${chip} (${coveragePct}%)`, 3)
+              .addRaw(
+                `Lines covered: **${linesHit} / ${linesFound}** (${coveragePct}%)\n\n`
+              )
+              .addTable([
+                [
+                  { data: "Binary", header: true },
+                  { data: "Status", header: true },
+                  { data: "Coverage File", header: true },
+                  { data: "Duration (s)", header: true },
+                ],
+                ...results.map((r) => [
+                  r.binary,
+                  r.passed ? "PASS" : `FAIL (exit ${r.exitCode})`,
+                  r.hasCoverage ? "Yes" : "No",
+                  String(r.durationSec),
+                ]),
+              ])
+              .write();
+
+      - name: Upload target coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.chip }}
+          path: pages/${{ matrix.chip }}
+          if-no-files-found: warn
+
+  publish:
+    name: Publish Coverage to GitHub Pages
+    needs: [setup, coverage]
+    if: always() && needs.setup.result == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Download all target coverage artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: downloaded-artifacts
+
+      - name: Assemble GitHub Pages site and index
+        uses: actions/github-script@v7
+        env:
+          ESP_HAL_REF: ${{ inputs.ref || 'main' }}
+        with:
+          script: |
+            const fs = require("fs");
+            const path = require("path");
+
+            const artifactsRoot = "downloaded-artifacts";
+            const siteDir = "site";
+            fs.mkdirSync(siteDir, { recursive: true });
+
+            const summaries = [];
+            if (fs.existsSync(artifactsRoot)) {
+              const entries = fs
+                .readdirSync(artifactsRoot, { withFileTypes: true })
+                .filter(
+                  (d) => d.isDirectory() && d.name.startsWith("coverage-")
+                )
+                .sort((a, b) => a.name.localeCompare(b.name));
+
+              for (const entry of entries) {
+                const chip = entry.name.replace(/^coverage-/, "");
+                const srcDir = path.join(artifactsRoot, entry.name);
+                const destDir = path.join(siteDir, chip);
+                fs.cpSync(srcDir, destDir, { recursive: true });
+
+                const summaryPath = path.join(destDir, "summary.json");
+                if (fs.existsSync(summaryPath)) {
+                  summaries.push(
+                    JSON.parse(fs.readFileSync(summaryPath, "utf8"))
+                  );
+                }
+              }
+            }
+
+            if (summaries.length === 0) {
+              core.setFailed("No target coverage artifacts were found to publish.");
+              return;
+            }
+
+            const ref = process.env.ESP_HAL_REF || "main";
+            const generatedAt = new Date().toISOString();
+
+            const rowsHtml = summaries
+              .map((s) => {
+                const pct = Number(s.coveragePct || 0).toFixed(2);
+                const badgeClass =
+                  s.coveragePct >= 75
+                    ? "high"
+                    : s.coveragePct >= 50
+                      ? "med"
+                      : "low";
+                const hasLcov = fs.existsSync(
+                  path.join(siteDir, s.chip, "lcov.info")
+                );
+                const lcovLink = hasLcov
+                  ? `<a href="./${s.chip}/lcov.info">lcov.info</a>`
+                  : "N/A";
+                return `
+                  <tr>
+                    <td><a href="./${s.chip}/index.html"><strong>${s.chip}</strong></a></td>
+                    <td><code>${s.arch}</code></td>
+                    <td>
+                      <div class="bar-container">
+                        <div class="bar ${badgeClass}" style="width: ${Math.min(100, Math.max(0, s.coveragePct))}%"></div>
+                        <span>${pct}%</span>
+                      </div>
+                    </td>
+                    <td>${s.linesHit} / ${s.linesFound}</td>
+                    <td>${s.passedBinaries} / ${s.totalBinaries} passed</td>
+                    <td>${lcovLink}</td>
+                  </tr>`;
+              })
+              .join("\n");
+
+            const indexHtml = `<!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1">
+              <title>esp-hal HIL Coverage Report</title>
+              <style>
+                :root {
+                  color-scheme: light dark;
+                  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+                }
+                body {
+                  max-width: 960px;
+                  margin: 2rem auto;
+                  padding: 0 1rem;
+                  line-height: 1.5;
+                }
+                h1 { margin-bottom: 0.25rem; }
+                .meta { color: #666; margin-bottom: 1.5rem; font-size: 0.9rem; }
+                table {
+                  width: 100%;
+                  border-collapse: collapse;
+                  margin-top: 1rem;
+                }
+                th, td {
+                  text-align: left;
+                  padding: 0.75rem;
+                  border-bottom: 1px solid rgba(128, 128, 128, 0.3);
+                }
+                th { font-weight: 600; }
+                a { color: #0969da; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+                .bar-container {
+                  display: flex;
+                  align-items: center;
+                  gap: 0.5rem;
+                }
+                .bar {
+                  height: 10px;
+                  border-radius: 4px;
+                  min-width: 4px;
+                }
+                .bar.high { background-color: #2da44e; }
+                .bar.med { background-color: #d29922; }
+                .bar.low { background-color: #cf222e; }
+              </style>
+            </head>
+            <body>
+              <h1>esp-hal HIL Coverage Report</h1>
+              <div class="meta">
+                Repository: <a href="https://github.com/esp-rs/esp-hal">esp-rs/esp-hal</a> (ref: <code>${ref}</code>) &bull;
+                Generated: <code>${generatedAt}</code>
+              </div>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Target</th>
+                    <th>Arch</th>
+                    <th>Line Coverage</th>
+                    <th>Lines (Hit / Total)</th>
+                    <th>HIL Binaries</th>
+                    <th>LCOV</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${rowsHtml}
+                </tbody>
+              </table>
+            </body>
+            </html>`;
+
+            fs.writeFileSync(path.join(siteDir, "index.html"), indexHtml);
+            fs.writeFileSync(path.join(siteDir, ".nojekyll"), "");
+
+            await core.summary
+              .addHeading("ESP-HAL HIL Coverage Report", 2)
+              .addTable([
+                [
+                  { data: "Target", header: true },
+                  { data: "Arch", header: true },
+                  { data: "Line Coverage", header: true },
+                  { data: "Lines (Hit / Total)", header: true },
+                  { data: "Binaries Passed", header: true },
+                ],
+                ...summaries.map((s) => [
+                  s.chip,
+                  s.arch,
+                  `${Number(s.coveragePct || 0).toFixed(2)}%`,
+                  `${s.linesHit} / ${s.linesFound}`,
+                  `${s.passedBinaries} / ${s.totalBinaries}`,
+                ]),
+              ])
+              .write();
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
