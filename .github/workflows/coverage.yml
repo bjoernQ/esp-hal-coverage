@@ -187,7 +187,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cargo/bin/wokwi-test-runner
-          key: wokwi-test-runner-${{ runner.os }}-v1
+          key: wokwi-test-runner-${{ runner.os }}-v2
 
       - name: Install wokwi-test-runner and wokwi-cli
         uses: actions/github-script@v7
@@ -220,7 +220,7 @@ jobs:
 
             // Install wokwi-test-runner if not restored from cache
             if (process.env.RUNNER_CACHED !== "true") {
-              core.info("Installing wokwi-test-runner from git...");
+              core.info("Installing wokwi-test-runner...");
               await exec.exec("cargo", [
                 "install",
                 "--git",
@@ -416,8 +416,10 @@ jobs:
               }
             } else {
               core.warning(`No LCOV tracefiles were produced for ${chip}`);
+              const htmlDir = path.join(pagesDir, "html");
+              fs.mkdirSync(htmlDir, { recursive: true });
               fs.writeFileSync(
-                path.join(pagesDir, "index.html"),
+                path.join(htmlDir, "index.html"),
                 `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${chip} Coverage</title></head><body><h1>No coverage data collected for ${chip}</h1></body></html>`
               );
             }
@@ -545,9 +547,14 @@ jobs:
                 const lcovLink = hasLcov
                   ? `<a href="./${s.chip}/lcov.info">lcov.info</a>`
                   : "N/A";
+                const reportHref = fs.existsSync(
+                  path.join(siteDir, s.chip, "html", "index.html")
+                )
+                  ? `./${s.chip}/html/index.html`
+                  : `./${s.chip}/index.html`;
                 return `
                   <tr>
-                    <td><a href="./${s.chip}/index.html"><strong>${s.chip}</strong></a></td>
+                    <td><a href="${reportHref}"><strong>${s.chip}</strong></a></td>
                     <td><code>${s.arch}</code></td>
                     <td>
                       <div class="bar-container">
