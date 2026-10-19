@@ -18,6 +18,11 @@ on:
         required: false
         default: ""
         type: string
+      exclude_tests:
+        description: "Comma- or space-separated list of HIL test binary names to skip"
+        required: false
+        default: "radio_basic_has_wifi_ble"
+        type: string
 
 permissions:
   contents: read
@@ -240,6 +245,7 @@ jobs:
           CHIP: ${{ matrix.chip }}
           TARGET_CONFIG: ${{ toJSON(matrix) }}
           INPUT_TESTS: ${{ inputs.tests }}
+          INPUT_EXCLUDE_TESTS: ${{ inputs.exclude_tests }}
           WOKWI_CLI_TOKEN: ${{ secrets.WOKWI_CLI_TOKEN }}
           CARGO_PROFILE_RELEASE_DEBUG: "2"
         with:
@@ -250,6 +256,12 @@ jobs:
             const chip = process.env.CHIP;
             const targetConfig = JSON.parse(process.env.TARGET_CONFIG);
             const inputTests = (process.env.INPUT_TESTS || "").trim();
+            const excludedTests = new Set(
+              (process.env.INPUT_EXCLUDE_TESTS || "")
+                .split(/[\s,]+/)
+                .map((s) => s.trim())
+                .filter(Boolean)
+            );
 
             if (!process.env.WOKWI_CLI_TOKEN) {
               core.warning(
@@ -285,7 +297,7 @@ jobs:
               return;
             }
 
-            const elfFiles = fs
+            const allElfFiles = fs
               .readdirSync(testsDir, { withFileTypes: true })
               .filter(
                 (entry) =>
@@ -296,8 +308,20 @@ jobs:
               .map((entry) => entry.name)
               .sort();
 
+            const skippedElfFiles = allElfFiles.filter((name) =>
+              excludedTests.has(name)
+            );
+            const elfFiles = allElfFiles.filter(
+              (name) => !excludedTests.has(name)
+            );
+
+            if (skippedElfFiles.length > 0) {
+              core.info(
+                `Excluding ${skippedElfFiles.length} HIL test binaries for ${chip}: ${skippedElfFiles.join(", ")}`
+              );
+            }
             core.info(
-              `Found ${elfFiles.length} HIL test binaries for ${chip}: ${elfFiles.join(", ")}`
+              `Running ${elfFiles.length} HIL test binaries for ${chip}: ${elfFiles.join(", ")}`
             );
 
             const lcovDir = path.join("coverage-lcov", chip);
